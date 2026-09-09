@@ -107,11 +107,6 @@ contract AbsoluteDebtAnnihilationEngine {
         if (debtor == address(0) || creditor == address(0)) revert ZeroAddress();
         if (blacklistedInstitutions[creditor]) revert CreditorBlacklisted();
 
-        if (token != address(0) && tokenAmount > 0) {
-            bool success = IERC20(token).transferFrom(msg.sender, address(this), tokenAmount);
-            if (!success) revert TransferFailed();
-        }
-
         DebtObligation storage obs = registry[debtor][creditor];
         obs.principal += principal;
         obs.accumulatedUsury += interest;
@@ -126,6 +121,12 @@ contract AbsoluteDebtAnnihilationEngine {
         }
 
         emit ObligationRegistered(debtor, creditor, principal + interest, msg.value);
+
+        // CEI Pattern: External interaction at the very end
+        if (token != address(0) && tokenAmount > 0) {
+            bool success = IERC20(token).transferFrom(msg.sender, address(this), tokenAmount);
+            if (!success) revert TransferFailed();
+        }
     }
 
     // --- ОДНОСТОРОННЯЯ ЛИКВИДАЦИЯ ДОЛГА ---
@@ -150,6 +151,7 @@ contract AbsoluteDebtAnnihilationEngine {
 
     /**
      * @dev Внутренняя атомарная процедура очистки реестра и отправки активов.
+     * Залоги начисляются в Vault (Pull-механизм) для устранения вызовов (external calls) внутри циклов (предотвращение DOS).
      */
     function _purgeSingleDebt(address debtor, address creditor) internal {
         DebtObligation storage obs = registry[debtor][creditor];
@@ -160,7 +162,7 @@ contract AbsoluteDebtAnnihilationEngine {
         uint256 tokensToRelease = obs.tokenCollateral;
         address token = obs.collateralToken;
 
-        // Полный сброс состояния обязательства (CEI Pattern)
+        // Полный сброс состояния обязательства
         obs.principal = 0;
         obs.accumulatedUsury = 0;
         obs.ethCollateral = 0;
@@ -170,24 +172,15 @@ contract AbsoluteDebtAnnihilationEngine {
         totalDebtPurged += fakeValue;
         blacklistedInstitutions[creditor] = true;
 
-        // Возврат нативного ETH должнику
+        // Использование Pull-механизма вместо прямого Push перевода (предотвращает Reentrancy и DoS в циклах)
         if (ethToRelease > 0) {
             totalEthLiberated += ethToRelease;
-            (bool ethOk, ) = payable(debtor).call{value: ethToRelease}("");
-            if (!ethOk) {
-                ethVault[debtor] += ethToRelease;
-            }
+            ethVault[debtor] += ethToRelease;
         }
 
-        // Возврат ERC-20 токенов должнику
         if (tokensToRelease > 0 && token != address(0)) {
             totalTokensLiberated += tokensToRelease;
-            (bool tokenOk, bytes memory data) = token.call(
-                abi.encodeWithSelector(IERC20.transfer.selector, debtor, tokensToRelease)
-            );
-            if (!tokenOk || (data.length != 0 && !abi.decode(data, (bool)))) {
-                tokenVault[debtor][token] += tokensToRelease;
-            }
+            tokenVault[debtor][token] += tokensToRelease;
         }
 
         emit DebtPurged(debtor, creditor, fakeValue);
@@ -221,8 +214,11 @@ contract AbsoluteDebtAnnihilationEngine {
      * @notice Терминальное исполнение: аннулирует все зарегистрированные позиции и навсегда блокирует контракт.
      */
     function executeGlobalPurge(address[] calldata creditors) external onlyAuthority activeSystem nonReentrant {
+        systemTerminated = true; // Block further actions immediately
+
         uint256 dCount = debtorList.length;
         uint256 cCount = creditors.length;
+        uint256 debtorsFreedThisRun = 0;
 
         for (uint256 i = 0; i < dCount; i++) {
             address debtor = debtorList[i];
@@ -235,11 +231,11 @@ contract AbsoluteDebtAnnihilationEngine {
                 }
             }
             if (hadDebts) {
-                totalDebtorsFreed += 1;
+                debtorsFreedThisRun += 1;
             }
         }
 
-        systemTerminated = true;
+        totalDebtorsFreed += debtorsFreedThisRun;
         emit ProtocolTerminated(totalDebtPurged);
     }
 
