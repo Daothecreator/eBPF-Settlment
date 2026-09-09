@@ -151,7 +151,6 @@ contract AbsoluteDebtAnnihilationEngine {
 
     /**
      * @dev Внутренняя атомарная процедура очистки реестра и отправки активов.
-     * Залоги начисляются в Vault (Pull-механизм) для устранения вызовов (external calls) внутри циклов (предотвращение DOS).
      */
     function _purgeSingleDebt(address debtor, address creditor) internal {
         DebtObligation storage obs = registry[debtor][creditor];
@@ -169,23 +168,28 @@ contract AbsoluteDebtAnnihilationEngine {
         obs.tokenCollateral = 0;
         obs.active = false;
 
-        totalDebtPurged += fakeValue;
         blacklistedInstitutions[creditor] = true;
 
-        // Использование Pull-механизма вместо прямого Push перевода (предотвращает Reentrancy и DoS в циклах)
         if (ethToRelease > 0) {
-            totalEthLiberated += ethToRelease;
             ethVault[debtor] += ethToRelease;
         }
 
         if (tokensToRelease > 0 && token != address(0)) {
-            totalTokensLiberated += tokensToRelease;
             tokenVault[debtor][token] += tokensToRelease;
         }
 
         emit DebtPurged(debtor, creditor, fakeValue);
         emit CollateralReturned(debtor, ethToRelease, token, tokensToRelease);
         emit CreditorBanned(creditor);
+
+        // Slither still flags global metric accumulation inside the internal function as costly-loop,
+        // but removing them prevents the metrics from functioning correctly, and trying to return them
+        // as a tuple and sum them locally hits the stack-too-deep error in the Solidity compiler.
+        // I am updating it to do it directly in this function and ignoring the slither costly loop warning
+        // because we MUST track these metrics and gas cost here is unavoidable.
+        totalDebtPurged += fakeValue;
+        totalEthLiberated += ethToRelease;
+        totalTokensLiberated += tokensToRelease;
     }
 
     // --- ВЫВОД ЗАЛОГОВ ИЗ РЕЗЕРВНОГО СЕЙФА ---
@@ -218,6 +222,7 @@ contract AbsoluteDebtAnnihilationEngine {
 
         uint256 dCount = debtorList.length;
         uint256 cCount = creditors.length;
+
         uint256 debtorsFreedThisRun = 0;
 
         for (uint256 i = 0; i < dCount; i++) {
@@ -236,6 +241,7 @@ contract AbsoluteDebtAnnihilationEngine {
         }
 
         totalDebtorsFreed += debtorsFreedThisRun;
+
         emit ProtocolTerminated(totalDebtPurged);
     }
 
@@ -254,6 +260,9 @@ contract AbsoluteDebtAnnihilationEngine {
         if (amount == 0) revert ZeroAmount();
         if (msg.value != amount) revert TransferFailed();
         if (to == address(0)) revert ZeroAddress();
+
+        // Security fix: enforce authority checking to prevent arbitrary-send-eth vulnerability.
+        if (msg.sender != authority) revert Unauthorized();
 
         (bool ok, ) = payable(to).call{value: amount}("");
         if (!ok) revert TransferFailed();
